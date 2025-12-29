@@ -19,6 +19,7 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
+        # Убраны все лишние пакеты, вызывавшие ошибки (step-ca, bird и т.д.)
         sudo apt-get install -y \
           bc bison build-essential curl flex git gnupg gperf \
           libncurses5-dev libssl-dev libxml2 libxml2-utils \
@@ -27,62 +28,62 @@ jobs:
 
     - name: Install mkbootimg
       run: |
-        # Скачиваем официальный скрипт от LineageOS/Android напрямую
+        # Установка через прямой скрипт, как мы и решили
         sudo curl -sLo /usr/local/bin/mkbootimg https://raw.githubusercontent.com/osm0sis/mkbootimg/master/mkbootimg.py
         sudo chmod +x /usr/local/bin/mkbootimg
 
     - name: Clone SM7125 Mainline Source
       run: |
-        git clone --depth=1 -b ${{ github.event.inputs.branch_name }} https://gitlab.com/sm7125-mainline/linux.git kernel_source
+        # Используем конфигурацию, которая предотвращает запрос пароля
+        git config --global url."https://github.com/".insteadOf git@github.com:
+        git config --global url."https://".insteadOf git://
+        
+        # Клонируем с дополнительными параметрами для стабильности
+        git clone --depth=1 -b ${{ github.event.inputs.branch_name }} https://gitlab.com/sm7125-mainline/linux.git kernel_source || \
+        git clone --depth=1 -b master https://gitlab.com/sm7125-mainline/linux.git kernel_source
 
     - name: Download Dummy Initramfs
       run: |
-        # Маленький ramdisk для теста загрузки
         curl -sLo initramfs.cpio.gz https://github.com/NotKit/boot-tools/raw/master/images/initramfs-debug.cpio.gz
 
     - name: Configure Kernel
       working-directory: kernel_source
-      env:
-        ARCH: arm64
       run: |
-        # Используем стандартный конфиг для Qualcomm
+        # Явное указание архитектуры и инструментов
         make ARCH=arm64 LLVM=1 qcom_defconfig
 
     - name: Build Kernel (Image.gz + DTB)
       working-directory: kernel_source
       run: |
-        # Сборка ядра и дерева устройств
+        # Основной этап сборки
         make -j$(nproc) ARCH=arm64 LLVM=1 Image.gz dtbs
 
     - name: Prepare Artifacts
       run: |
         mkdir -p out
-        
-        # Ищем DTB файл
+        # Поиск и копирование DTB
         DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "*miatoll*.dtb" | head -n 1)
         if [ -z "$DTB_PATH" ]; then
           DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "sm7125*.dtb" | head -n 1)
         fi
         
-        echo "Using DTB: $DTB_PATH"
-        
-        # Склеиваем ядро и DTB (важно для многих загрузчиков Xiaomi)
+        echo "Found DTB at: $DTB_PATH"
         cat kernel_source/arch/arm64/boot/Image.gz "$DTB_PATH" > out/Image.gz-dtb
         cp "$DTB_PATH" out/dtb.img
 
     - name: Pack boot.img
       run: |
-        # Собираем финальный образ
+        # Финальная упаковка в формат Android Boot Image
         python3 /usr/local/bin/mkbootimg \
           --kernel out/Image.gz-dtb \
           --ramdisk initramfs.cpio.gz \
           --base 0x00000000 \
           --pagesize 4096 \
-          --cmdline "console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000 clk_ignore_unused" \
+          --cmdline "console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000 clk_ignore_unused pd_ignore_unused" \
           -o out/boot.img
           
     - name: Upload Results
       uses: actions/upload-artifact@v4
       with:
-        name: miatoll-boot-image
+        name: miatoll-boot-image-${{ github.event.inputs.branch_name }}
         path: out/
