@@ -1,7 +1,7 @@
 name: Build Bootable Mainline Kernel for Miatoll (SM7125)
 
 on:
-  workflow_dispatch: # Ручной запуск из вкладки Actions
+  workflow_dispatch:
     inputs:
       branch_name:
         description: 'Branch to build (sm7125-next is recommended)'
@@ -16,88 +16,73 @@ jobs:
     - name: Checkout Work Space
       uses: actions/checkout@v4
 
-    - name: Install Build Dependencies & Toolchain
+    - name: Install Build Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-          git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
-          lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev \
-          libwxgtk3.0-gtk3-dev libxml2 libxml2-utils lzop pngcrush \
-          rsync bird step-ca schedtool squashfs-tools xsltproc zip zlib1g-dev \
-          python3-pip python3-dev device-tree-compiler lld llvm clang \
-          gcc-aarch64-linux-gnu
+          bc bison build-essential curl flex git gnupg gperf \
+          libncurses5-dev libssl-dev libxml2 libxml2-utils \
+          lzop python3 python3-pip zip zlib1g-dev \
+          device-tree-compiler lld llvm clang gcc-aarch64-linux-gnu
 
-    - name: Install mkbootimg & Utils
+    - name: Install mkbootimg
       run: |
-        # Скачиваем скрипт mkbootimg напрямую, чтобы избежать проблем с pip
+        # Скачиваем официальный скрипт от LineageOS/Android напрямую
         sudo curl -sLo /usr/local/bin/mkbootimg https://raw.githubusercontent.com/osm0sis/mkbootimg/master/mkbootimg.py
         sudo chmod +x /usr/local/bin/mkbootimg
-        # abootimg может пригодиться для анализа образов
-        sudo apt-get install -y abootimg
 
     - name: Clone SM7125 Mainline Source
       run: |
-        echo "Cloning branch ${{ github.event.inputs.branch_name }}..."
         git clone --depth=1 -b ${{ github.event.inputs.branch_name }} https://gitlab.com/sm7125-mainline/linux.git kernel_source
 
     - name: Download Dummy Initramfs
       run: |
-        # Используем проверенный initramfs для отладки
+        # Маленький ramdisk для теста загрузки
         curl -sLo initramfs.cpio.gz https://github.com/NotKit/boot-tools/raw/master/images/initramfs-debug.cpio.gz
 
     - name: Configure Kernel
       working-directory: kernel_source
       env:
         ARCH: arm64
-        LLVM: 1
       run: |
-        # Используем дефолтную конфигурацию для Qualcomm в Mainline
-        make qcom_defconfig
+        # Используем стандартный конфиг для Qualcomm
+        make ARCH=arm64 LLVM=1 qcom_defconfig
 
     - name: Build Kernel (Image.gz + DTB)
       working-directory: kernel_source
-      env:
-        ARCH: arm64
-        LLVM: 1
       run: |
-        echo "Starting compilation with LLVM/Clang..."
-        make -j$(nproc) Image.gz dtbs
+        # Сборка ядра и дерева устройств
+        make -j$(nproc) ARCH=arm64 LLVM=1 Image.gz dtbs
 
-    - name: Prepare Boot Image Components
+    - name: Prepare Artifacts
       run: |
         mkdir -p out
         
-        # Поиск DTB файла для miatoll (или наиболее подходящего sm7125)
+        # Ищем DTB файл
         DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "*miatoll*.dtb" | head -n 1)
         if [ -z "$DTB_PATH" ]; then
-          echo "Miatoll-specific DTB not found, trying generic SM7125..."
           DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "sm7125*.dtb" | head -n 1)
         fi
         
-        echo "Selected DTB: $DTB_PATH"
-        cp kernel_source/arch/arm64/boot/Image.gz out/
-        cp "$DTB_PATH" out/dtb.img
+        echo "Using DTB: $DTB_PATH"
         
-        # Создаем Appended DTB (Ядро + DTB в одном файле)
+        # Склеиваем ядро и DTB (важно для многих загрузчиков Xiaomi)
         cat kernel_source/arch/arm64/boot/Image.gz "$DTB_PATH" > out/Image.gz-dtb
+        cp "$DTB_PATH" out/dtb.img
 
     - name: Pack boot.img
       run: |
-        cd out
-        # Командная строка для вывода логов в консоль
-        CMDLINE="console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000 clk_ignore_unused pd_ignore_unused"
-        
+        # Собираем финальный образ
         python3 /usr/local/bin/mkbootimg \
-          --kernel Image.gz-dtb \
-          --ramdisk ../initramfs.cpio.gz \
+          --kernel out/Image.gz-dtb \
+          --ramdisk initramfs.cpio.gz \
           --base 0x00000000 \
           --pagesize 4096 \
-          --cmdline "$CMDLINE" \
-          -o boot.img
+          --cmdline "console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000 clk_ignore_unused" \
+          -o out/boot.img
           
-    - name: Upload Artifacts
+    - name: Upload Results
       uses: actions/upload-artifact@v4
       with:
-        name: miatoll-kernel-${{ github.event.inputs.branch_name }}
+        name: miatoll-boot-image
         path: out/
