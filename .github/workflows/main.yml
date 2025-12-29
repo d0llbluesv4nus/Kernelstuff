@@ -1,10 +1,10 @@
 name: Build Bootable Mainline Kernel for Miatoll (SM7125)
 
 on:
-  workflow_dispatch: # Ручной запуск
+  workflow_dispatch: # Ручной запуск из вкладки Actions
     inputs:
       branch_name:
-        description: 'Branch to build (usually sm7125-next or master)'
+        description: 'Branch to build (sm7125-next is recommended)'
         required: true
         default: 'sm7125-next'
 
@@ -24,83 +24,73 @@ jobs:
           git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
           lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev \
           libwxgtk3.0-gtk3-dev libxml2 libxml2-utils lzop pngcrush \
-          rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
-          python3-pip python3-dev device-tree-compiler lld llvm clang
+          rsync bird step-ca schedtool squashfs-tools xsltproc zip zlib1g-dev \
+          python3-pip python3-dev device-tree-compiler lld llvm clang \
+          gcc-aarch64-linux-gnu
 
-    - name: Install mkbootimg
+    - name: Install mkbootimg & Utils
       run: |
-        pip3 install mkbootimg
+        # Скачиваем скрипт mkbootimg напрямую, чтобы избежать проблем с pip
+        sudo curl -sLo /usr/local/bin/mkbootimg https://raw.githubusercontent.com/osm0sis/mkbootimg/master/mkbootimg.py
+        sudo chmod +x /usr/local/bin/mkbootimg
+        # abootimg может пригодиться для анализа образов
+        sudo apt-get install -y abootimg
 
     - name: Clone SM7125 Mainline Source
-      # Мы используем GitLab репозиторий сообщества, так как в torvalds нет поддержки miatoll
       run: |
-        echo "Cloning branch ${{ inputs.branch_name }}..."
-        git clone --depth=1 -b ${{ inputs.branch_name }} https://gitlab.com/sm7125-mainline/linux.git kernel_source
+        echo "Cloning branch ${{ github.event.inputs.branch_name }}..."
+        git clone --depth=1 -b ${{ github.event.inputs.branch_name }} https://gitlab.com/sm7125-mainline/linux.git kernel_source
 
     - name: Download Dummy Initramfs
-      # Для создания boot.img нужен initramfs. Скачиваем минимальный (от PostmarketOS или подобный)
-      # Это позволит ядру загрузиться и выдать лог, даже если Android не запустится.
       run: |
-        wget -O initramfs.cpio.gz https://github.com/NotKit/boot-tools/raw/master/images/initramfs-debug.cpio.gz
+        # Используем проверенный initramfs для отладки
+        curl -sLo initramfs.cpio.gz https://github.com/NotKit/boot-tools/raw/master/images/initramfs-debug.cpio.gz
 
     - name: Configure Kernel
       working-directory: kernel_source
       env:
         ARCH: arm64
-        CC: clang
-        CROSS_COMPILE: aarch64-linux-gnu-
-        CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
         LLVM: 1
       run: |
-        # Используем дефолтный конфиг для Qualcomm
+        # Используем дефолтную конфигурацию для Qualcomm в Mainline
         make qcom_defconfig
 
     - name: Build Kernel (Image.gz + DTB)
       working-directory: kernel_source
       env:
         ARCH: arm64
-        CC: clang
-        CROSS_COMPILE: aarch64-linux-gnu-
-        CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
         LLVM: 1
       run: |
-        echo "Compiling Kernel..."
+        echo "Starting compilation with LLVM/Clang..."
         make -j$(nproc) Image.gz dtbs
 
     - name: Prepare Boot Image Components
-      working-directory: kernel_source
       run: |
-        mkdir -p ../out
+        mkdir -p out
         
-        # 1. Находим DTB для Miatoll. Имя может отличаться, ищем по шаблону sm7125
-        # Обычно это sm7125-xiaomi-miatoll.dtb или sm7125-xiaomi-curtana.dtb
-        DTB_FILE=$(find arch/arm64/boot/dts/qcom/ -name "*miatoll*.dtb" | head -n 1)
-        
-        if [ -z "$DTB_FILE" ]; then
-            echo "WARNING: Specific Miatoll DTB not found. Looking for generic SM7125..."
-            DTB_FILE=$(find arch/arm64/boot/dts/qcom/ -name "sm7125*.dtb" | head -n 1)
+        # Поиск DTB файла для miatoll (или наиболее подходящего sm7125)
+        DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "*miatoll*.dtb" | head -n 1)
+        if [ -z "$DTB_PATH" ]; then
+          echo "Miatoll-specific DTB not found, trying generic SM7125..."
+          DTB_PATH=$(find kernel_source/arch/arm64/boot/dts/qcom/ -name "sm7125*.dtb" | head -n 1)
         fi
         
-        echo "Using DTB: $DTB_FILE"
-        cp arch/arm64/boot/Image.gz ../out/
-        cp "$DTB_FILE" ../out/dtb.img
-        cp ../initramfs.cpio.gz ../out/
+        echo "Selected DTB: $DTB_PATH"
+        cp kernel_source/arch/arm64/boot/Image.gz out/
+        cp "$DTB_PATH" out/dtb.img
         
-        # 2. Appended DTB (соединяем ядро и дерево устройств)
-        # Это повышает совместимость с загрузчиком
-        cat arch/arm64/boot/Image.gz "$DTB_FILE" > ../out/Image.gz-dtb
+        # Создаем Appended DTB (Ядро + DTB в одном файле)
+        cat kernel_source/arch/arm64/boot/Image.gz "$DTB_PATH" > out/Image.gz-dtb
 
     - name: Pack boot.img
       run: |
         cd out
-        
-        # Параметры командной строки для отладки
+        # Командная строка для вывода логов в консоль
         CMDLINE="console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000 clk_ignore_unused pd_ignore_unused"
         
-        # Создаем образ. Оффсеты стандартные для QCOM, но могут требовать уточнений
-        mkbootimg \
+        python3 /usr/local/bin/mkbootimg \
           --kernel Image.gz-dtb \
-          --ramdisk initramfs.cpio.gz \
+          --ramdisk ../initramfs.cpio.gz \
           --base 0x00000000 \
           --pagesize 4096 \
           --cmdline "$CMDLINE" \
@@ -109,5 +99,5 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: miatoll-mainline-boot
+        name: miatoll-kernel-${{ github.event.inputs.branch_name }}
         path: out/
